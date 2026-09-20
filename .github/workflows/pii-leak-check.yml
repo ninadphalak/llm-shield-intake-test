@@ -1,0 +1,25 @@
+name: PII leak check
+
+# A stand-in for a real gateway's CI, used to test the results-wall intake end to end.
+# The target is `capture://self`, which is a direct connection with no gateway in the
+# middle, so every data type leaks. That is the point: it is the negative control, and it
+# produces a genuine report artifact for the intake to read.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  pii-leak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ninadphalak/LLM-Shield-Proxy@main
+        continue-on-error: true
+        with:
+          target-base-url: "capture://self"
+          target-version: "no-gateway-control-0.1"
+          artifact-name: pii-leak-benchmark
