@@ -1,0 +1,31 @@
+name: macOS (stranger audit)
+
+on: [pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install the three published packages
+        run: pip install llm-shield-proxy==1.6.9 pii-leak-benchmark==0.5.1 mcp-ssrf-check==0.2.1
+      - name: README three-command trial
+        run: |
+          UPSTREAM_BASE_URL=http://127.0.0.1:8765 UPSTREAM_API_KEY=unused VALID_VIRTUAL_KEYS=sk-demo llm-shield-proxy --port 4000 > proxy.log 2>&1 &
+          for i in $(seq 1 60); do curl -fs http://127.0.0.1:4000/healthz && break; sleep 1; done
+          pii-leak-benchmark selfcheck --target-base-url http://127.0.0.1:4000/v1 --target-api-key sk-demo
+      - name: No-gateway control, ci, v2 validate, checker
+        run: |
+          pii-leak-benchmark selfcheck --target-base-url capture://self || true
+          pii-leak-benchmark ci --target-base-url http://127.0.0.1:4000/v1 --target-api-key sk-demo --out pii-check | head -12
+          pip install "pii-leak-benchmark[validate]"
+          pii-leak-benchmark-v2 --validate --out ./v2 --only passthrough
+          mcp-ssrf-check --url http://127.0.0.1:4000/mcp || true
+      - name: Proxy startup log
+        if: always()
+        run: head -20 proxy.log
