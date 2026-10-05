@@ -1,0 +1,106 @@
+name: Try it from scratch, on Linux (stranger audit)
+
+# Runs the "Try it from scratch" page's steps 1 to 4 on a Linux Docker host, which the page
+# says has not been tested. Two variants of step 4: as written (host.docker.internal), and
+# with the host network, the change step 3 documents for Linux.
+
+on: [pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  from-scratch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: "Step 1: install the benchmark"
+        run: pip install pii-leak-benchmark
+
+      - name: "Step 2: the no-gateway control must say LEAK"
+        run: |
+          set +e
+          pii-leak-benchmark selfcheck --target-base-url capture://self | head -8
+          echo "exit=$?"
+
+      - name: "Step 3 (Linux form): LLM-Shield-Proxy with --network host"
+        run: |
+          docker run -d --name shield --network host \
+            -e HOST=127.0.0.1 \
+            -e UPSTREAM_BASE_URL=http://127.0.0.1:8765/v1 \
+            -e UPSTREAM_API_KEY=sk-not-used-by-the-capture \
+            -e VALID_VIRTUAL_KEYS=sk-local-shield \
+            ghcr.io/ninadphalak/llm-shield-proxy:latest
+          for i in $(seq 1 60); do curl -fs http://127.0.0.1:8000/healthz && break; sleep 1; done
+          set +e
+          pii-leak-benchmark selfcheck --target-base-url http://localhost:8000/v1 --target-api-key sk-local-shield --json-out shield.json | head -8
+          echo "exit=$?"
+          docker rm -f shield
+
+      - name: "Step 4 as written (host.docker.internal), expected not to reach the capture on Linux"
+        run: |
+          docker network create bench
+          docker run -d --name presidio-analyzer --network bench -p 5002:3000 mcr.microsoft.com/presidio-analyzer:latest
+          docker run -d --name presidio-anonymizer --network bench -p 5001:3000 mcr.microsoft.com/presidio-anonymizer:latest
+          docker run -d --name litellm-db --network bench -e POSTGRES_PASSWORD=litellm -e POSTGRES_USER=litellm -e POSTGRES_DB=litellm postgres:16
+          cat > litellm.yaml <<'YAML'
+          model_list:
+            - model_name: conformance-model
+              litellm_params:
+                model: openai/conformance-model
+                api_base: http://host.docker.internal:8765/v1
+                api_key: sk-not-used-by-the-capture
+
+          guardrails:
+            - guardrail_name: presidio-mask
+              litellm_params:
+                guardrail: presidio
+                mode: pre_call
+                output_parse_pii: true
+                presidio_analyzer_api_base: http://presidio-analyzer:3000
+                presidio_anonymizer_api_base: http://presidio-anonymizer:3000
+                default_on: true
+
+          litellm_settings:
+            drop_params: true
+
+          general_settings:
+            master_key: sk-local-only
+          YAML
+          docker run -d --name litellm --network bench -p 4000:4000 \
+            --add-host=host.docker.internal:host-gateway \
+            -e DATABASE_URL="postgresql://litellm:litellm@litellm-db:5432/litellm" \
+            -e LITELLM_MASTER_KEY="sk-local-only" \
+            -v "$(pwd)/litellm.yaml:/app/config.yaml:ro" \
+            ghcr.io/berriai/litellm:main-latest --config /app/config.yaml --port 4000
+          for i in $(seq 1 180); do docker logs litellm 2>&1 | grep -q "Application startup complete" && break; sleep 2; done
+          echo "litellm up after $((i*2))s"
+          set +e
+          pii-leak-benchmark selfcheck --target-base-url http://localhost:4000/v1 --target-api-key sk-local-only --json-out litellm.json | head -12
+          echo "exit=$?"
+          docker rm -f litellm
+
+      - name: "Step 4, Linux variant: LiteLLM on the host network"
+        run: |
+          # Presidio and Postgres stay on the bench network; LiteLLM joins the host network, so
+          # it reaches the capture on 127.0.0.1:8765 and the others through their published ports.
+          docker rm -f litellm-db
+          docker run -d --name litellm-db --network bench -p 5432:5432 -e POSTGRES_PASSWORD=litellm -e POSTGRES_USER=litellm -e POSTGRES_DB=litellm postgres:16
+          sed -i 's#http://host.docker.internal:8765/v1#http://127.0.0.1:8765/v1#; s#http://presidio-analyzer:3000#http://127.0.0.1:5002#; s#http://presidio-anonymizer:3000#http://127.0.0.1:5001#' litellm.yaml
+          sleep 5
+          docker run -d --name litellm --network host \
+            -e DATABASE_URL="postgresql://litellm:litellm@127.0.0.1:5432/litellm" \
+            -e LITELLM_MASTER_KEY="sk-local-only" \
+            -v "$(pwd)/litellm.yaml:/app/config.yaml:ro" \
+            ghcr.io/berriai/litellm:main-latest --config /app/config.yaml --port 4000
+          for i in $(seq 1 180); do docker logs litellm 2>&1 | grep -q "Application startup complete" && break; sleep 2; done
+          echo "litellm up after $((i*2))s"
+          set +e
+          pii-leak-benchmark selfcheck --target-base-url http://localhost:4000/v1 --target-api-key sk-local-only --json-out litellm2.json | head -40
+          echo "exit=$?"
+          docker logs litellm 2>&1 | tail -5
+          docker rm -f litellm litellm-db presidio-analyzer presidio-anonymizer
+          docker network rm bench
