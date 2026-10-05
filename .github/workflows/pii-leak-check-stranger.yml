@@ -1,7 +1,6 @@
 name: PII leak check (stranger audit)
 
-on:
-  workflow_dispatch: {}
+on: [pull_request]
 
 permissions:
   contents: read
